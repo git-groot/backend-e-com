@@ -21,6 +21,7 @@
     "mongoose": "^9.6.2",
     "nodemon": "^3.1.14",
     "qrcode": "^1.5.4",
-    "speakeasy": "^2.0.0"
+    "speakeasy": "^2.0.0",
+    "webtorrent": "^1.9.7"
   }
 }
