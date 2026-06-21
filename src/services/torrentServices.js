@@ -1,32 +1,25 @@
-
 import path from "path";
 import fs from "fs";
 import client, { extraTrackers } from "../utilitys/torrentClient.js";
 
-// downloads folder at root level
 const DOWNLOAD_PATH = path.resolve("downloads");
 
-// make sure downloads folder exists
 if (!fs.existsSync(DOWNLOAD_PATH)) {
     fs.mkdirSync(DOWNLOAD_PATH, { recursive: true });
 }
 
-// in-memory store of all torrents
-// { infoHash: { infoHash, name, status, files, addedAt } }
 const torrentMap = new Map();
 
-// ─── Add Torrent ──────────────────────────────────────────
+// ─── Add Torrent (paused) ─────────────────────────────────
 export const addTorrent = (magnetURI) => {
     return new Promise((resolve, reject) => {
 
-        // validate magnet link
         if (!magnetURI || !magnetURI.startsWith("magnet:")) {
             return reject(new Error("Invalid magnet link"));
         }
 
-        // check if already added
         const existing = client.torrents.find(
-            (t) => t.magnetURI === magnetURI || magnetURI.includes(t.infoHash)
+            (t) => magnetURI.includes(t.infoHash)
         );
         if (existing) {
             return reject(new Error("Torrent already added"));
@@ -39,30 +32,32 @@ export const addTorrent = (magnetURI) => {
                 announce: extraTrackers,
             },
             (torrent) => {
-                // save to map
+                // pause immediately after adding
+                torrent.pause();
+
                 torrentMap.set(torrent.infoHash, {
                     infoHash: torrent.infoHash,
                     name: torrent.name,
-                    status: "downloading",
+                    magnetURI,
+                    status: "paused",
                     files: [],
                     addedAt: new Date(),
                 });
 
-                // when download completes
                 torrent.on("done", () => {
                     const files = torrent.files.map((f) => ({
                         name: f.name,
                         size: f.length,
-                        downloadUrl: `/files/${encodeURIComponent(f.path)}`,
+                        path: f.path,
                     }));
 
                     torrentMap.set(torrent.infoHash, {
                         ...torrentMap.get(torrent.infoHash),
-                        status: "seeding",
+                        status: "completed",
                         files,
                     });
 
-                    console.log(`✅ Torrent done: ${torrent.name}`);
+                    console.log(`✅ Done: ${torrent.name}`);
                 });
 
                 torrent.on("error", (err) => {
@@ -76,33 +71,32 @@ export const addTorrent = (magnetURI) => {
                 resolve({
                     infoHash: torrent.infoHash,
                     name: torrent.name,
-                    status: "downloading",
+                    status: "paused",
+                    message: "Torrent added. Click download to start.",
                 });
             }
         );
     });
 };
 
-// ─── Get Status of One Torrent ────────────────────────────
+// ─── Get Status ───────────────────────────────────────────
 export const getTorrentStatus = (infoHash) => {
     const torrent = client.get(infoHash);
     const meta = torrentMap.get(infoHash);
 
-    if (!torrent || !meta) {
-        return null;
-    }
+    if (!torrent || !meta) return null;
 
     return {
         infoHash: torrent.infoHash,
         name: torrent.name,
         status: meta.status,
-        progress: parseFloat((torrent.progress * 100).toFixed(2)),  // 0 to 100
-        downloadSpeed: torrent.downloadSpeed,   // bytes/sec
-        uploadSpeed: torrent.uploadSpeed,       // bytes/sec
+        progress: parseFloat((torrent.progress * 100).toFixed(2)),
+        downloadSpeed: torrent.downloadSpeed,
+        uploadSpeed: torrent.uploadSpeed,
         numPeers: torrent.numPeers,
-        downloaded: torrent.downloaded,         // bytes downloaded
-        totalSize: torrent.length,              // total bytes
-        timeRemaining: torrent.timeRemaining,   // ms remaining
+        downloaded: torrent.downloaded,
+        totalSize: torrent.length,
+        timeRemaining: torrent.timeRemaining,
         done: torrent.done,
         files: meta.files,
         addedAt: meta.addedAt,
@@ -131,14 +125,77 @@ export const removeTorrent = (infoHash, deleteFiles = false) => {
     return new Promise((resolve, reject) => {
         const torrent = client.get(infoHash);
 
-        if (!torrent) {
-            return reject(new Error("Torrent not found"));
-        }
+        if (!torrent) return reject(new Error("Torrent not found"));
 
         client.remove(infoHash, { destroyStore: deleteFiles }, (err) => {
             if (err) return reject(err);
             torrentMap.delete(infoHash);
             resolve({ success: true, deleteFiles });
+        });
+    });
+};
+
+// ─── Download: Start + Stream to Local ───────────────────
+export const startAndStreamDownload = (infoHash, res) => {
+    return new Promise((resolve, reject) => {
+        const torrent = client.get(infoHash);
+        const meta = torrentMap.get(infoHash);
+
+        if (!torrent || !meta) {
+            return reject(new Error("Torrent not found. Add it first."));
+        }
+
+        // ── Case 1: Already fully downloaded → stream immediately ──
+        if (torrent.done) {
+            const file = torrent.files[0]; // get first file (main file)
+            const filePath = path.resolve("downloads", file.path);
+
+            if (!fs.existsSync(filePath)) {
+                return reject(new Error("File not found on disk"));
+            }
+
+            res.setHeader("Content-Disposition", `attachment; filename="${file.name}"`);
+            res.setHeader("Content-Type", "application/octet-stream");
+            res.setHeader("Content-Length", file.length);
+
+            const stream = fs.createReadStream(filePath);
+            stream.pipe(res);
+            return;
+        }
+
+        // ── Case 2: Not downloaded yet → resume + wait for done ──
+        torrent.resume();
+
+        torrentMap.set(infoHash, {
+            ...meta,
+            status: "downloading",
+        });
+
+        console.log(`⬇️  Downloading: ${torrent.name}`);
+
+        torrent.on("done", () => {
+            const files = torrent.files.map((f) => ({
+                name: f.name,
+                size: f.length,
+                path: f.path,
+            }));
+
+            torrentMap.set(infoHash, {
+                ...torrentMap.get(infoHash),
+                status: "completed",
+                files,
+            });
+
+            // stream file to user after download completes
+            const file = torrent.files[0];
+            const filePath = path.resolve("downloads", file.path);
+
+            res.setHeader("Content-Disposition", `attachment; filename="${file.name}"`);
+            res.setHeader("Content-Type", "application/octet-stream");
+            res.setHeader("Content-Length", file.length);
+
+            const stream = fs.createReadStream(filePath);
+            stream.pipe(res);
         });
     });
 };
