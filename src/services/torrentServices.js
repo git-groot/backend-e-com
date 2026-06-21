@@ -8,9 +8,10 @@ if (!fs.existsSync(DOWNLOAD_PATH)) {
     fs.mkdirSync(DOWNLOAD_PATH, { recursive: true });
 }
 
+// stores ALL torrents (queued, downloading, completed)
 const torrentMap = new Map();
 
-// ─── Add Torrent (paused) ─────────────────────────────────
+// ─── Add to List Only (no download) ──────────────────────
 export const addTorrent = (magnetURI) => {
     return new Promise((resolve, reject) => {
 
@@ -18,136 +19,118 @@ export const addTorrent = (magnetURI) => {
             return reject(new Error("Invalid magnet link"));
         }
 
-        const existing = client.torrents.find(
-            (t) => magnetURI.includes(t.infoHash)
-        );
-        if (existing) {
-            return reject(new Error("Torrent already added"));
+        // extract infoHash from magnet link
+        const infoHashMatch = magnetURI.match(/urn:btih:([a-fA-F0-9]{40})/i);
+        if (!infoHashMatch) {
+            return reject(new Error("Invalid magnet link - no infoHash found"));
         }
 
-        client.add(
+        const infoHash = infoHashMatch[1].toLowerCase();
+
+        // check already in list
+        if (torrentMap.has(infoHash)) {
+            return reject(new Error("Torrent already in list"));
+        }
+
+        // extract name from magnet link
+        const nameMatch = magnetURI.match(/dn=([^&]+)/);
+        const name = nameMatch
+            ? decodeURIComponent(nameMatch[1].replace(/\+/g, " "))
+            : "Unknown Torrent";
+
+        // just save in map — no webtorrent yet
+        torrentMap.set(infoHash, {
+            infoHash,
+            name,
             magnetURI,
-            {
-                path: DOWNLOAD_PATH,
-                announce: extraTrackers,
-            },
-            (torrent) => {
-                // pause immediately after adding
-                torrent.pause();
+            status: "queued",      // ← queued means added but not downloading
+            progress: 0,
+            downloadSpeed: 0,
+            uploadSpeed: 0,
+            numPeers: 0,
+            downloaded: 0,
+            totalSize: 0,
+            timeRemaining: 0,
+            done: false,
+            files: [],
+            addedAt: new Date(),
+        });
 
-                torrentMap.set(torrent.infoHash, {
-                    infoHash: torrent.infoHash,
-                    name: torrent.name,
-                    magnetURI,
-                    status: "paused",
-                    files: [],
-                    addedAt: new Date(),
-                });
-
-                torrent.on("done", () => {
-                    const files = torrent.files.map((f) => ({
-                        name: f.name,
-                        size: f.length,
-                        path: f.path,
-                    }));
-
-                    torrentMap.set(torrent.infoHash, {
-                        ...torrentMap.get(torrent.infoHash),
-                        status: "completed",
-                        files,
-                    });
-
-                    console.log(`✅ Done: ${torrent.name}`);
-                });
-
-                torrent.on("error", (err) => {
-                    torrentMap.set(torrent.infoHash, {
-                        ...torrentMap.get(torrent.infoHash),
-                        status: "error",
-                        error: err.message,
-                    });
-                });
-
-                resolve({
-                    infoHash: torrent.infoHash,
-                    name: torrent.name,
-                    status: "paused",
-                    message: "Torrent added. Click download to start.",
-                });
-            }
-        );
+        resolve({
+            infoHash,
+            name,
+            status: "queued",
+            message: "Added to list. Click Download when you want the file.",
+        });
     });
-};
-
-// ─── Get Status ───────────────────────────────────────────
-export const getTorrentStatus = (infoHash) => {
-    const torrent = client.get(infoHash);
-    const meta = torrentMap.get(infoHash);
-
-    if (!torrent || !meta) return null;
-
-    return {
-        infoHash: torrent.infoHash,
-        name: torrent.name,
-        status: meta.status,
-        progress: parseFloat((torrent.progress * 100).toFixed(2)),
-        downloadSpeed: torrent.downloadSpeed,
-        uploadSpeed: torrent.uploadSpeed,
-        numPeers: torrent.numPeers,
-        downloaded: torrent.downloaded,
-        totalSize: torrent.length,
-        timeRemaining: torrent.timeRemaining,
-        done: torrent.done,
-        files: meta.files,
-        addedAt: meta.addedAt,
-    };
 };
 
 // ─── Get All Torrents ─────────────────────────────────────
 export const getAllTorrents = () => {
-    return client.torrents.map((torrent) => {
-        const meta = torrentMap.get(torrent.infoHash);
+    const result = [];
+
+    for (const [infoHash, meta] of torrentMap) {
+        // if actively downloading, get live stats from webtorrent
+        const torrent = client.get(infoHash);
+
+        if (torrent && !torrent.done) {
+            // update map with live stats
+            torrentMap.set(infoHash, {
+                ...meta,
+                status: "downloading",
+                progress: parseFloat((torrent.progress * 100).toFixed(2)),
+                downloadSpeed: torrent.downloadSpeed,
+                uploadSpeed: torrent.uploadSpeed,
+                numPeers: torrent.numPeers,
+                downloaded: torrent.downloaded,
+                totalSize: torrent.length,
+                timeRemaining: torrent.timeRemaining,
+            });
+
+            result.push(torrentMap.get(infoHash));
+        } else {
+            result.push(meta);
+        }
+    }
+
+    return result;
+};
+
+// ─── Get Status of One ────────────────────────────────────
+export const getTorrentStatus = (infoHash) => {
+    const meta = torrentMap.get(infoHash);
+    if (!meta) return null;
+
+    const torrent = client.get(infoHash);
+
+    if (torrent) {
         return {
-            infoHash: torrent.infoHash,
-            name: torrent.name,
-            status: meta?.status || "unknown",
+            ...meta,
             progress: parseFloat((torrent.progress * 100).toFixed(2)),
             downloadSpeed: torrent.downloadSpeed,
             numPeers: torrent.numPeers,
+            downloaded: torrent.downloaded,
+            totalSize: torrent.length,
+            timeRemaining: torrent.timeRemaining,
             done: torrent.done,
-            addedAt: meta?.addedAt,
         };
-    });
-};
+    }
 
-// ─── Remove Torrent ───────────────────────────────────────
-export const removeTorrent = (infoHash, deleteFiles = false) => {
-    return new Promise((resolve, reject) => {
-        const torrent = client.get(infoHash);
-
-        if (!torrent) return reject(new Error("Torrent not found"));
-
-        client.remove(infoHash, { destroyStore: deleteFiles }, (err) => {
-            if (err) return reject(err);
-            torrentMap.delete(infoHash);
-            resolve({ success: true, deleteFiles });
-        });
-    });
+    return meta;
 };
 
 // ─── Download: Start + Stream to Local ───────────────────
 export const startAndStreamDownload = (infoHash, res) => {
     return new Promise((resolve, reject) => {
-        const torrent = client.get(infoHash);
         const meta = torrentMap.get(infoHash);
 
-        if (!torrent || !meta) {
+        if (!meta) {
             return reject(new Error("Torrent not found. Add it first."));
         }
 
-        // ── Case 1: Already fully downloaded → stream immediately ──
-        if (torrent.done) {
-            const file = torrent.files[0]; // get first file (main file)
+        // ── Already completed → stream immediately ──
+        if (meta.status === "completed" && meta.files.length > 0) {
+            const file = meta.files[0];
             const filePath = path.resolve("downloads", file.path);
 
             if (!fs.existsSync(filePath)) {
@@ -156,46 +139,99 @@ export const startAndStreamDownload = (infoHash, res) => {
 
             res.setHeader("Content-Disposition", `attachment; filename="${file.name}"`);
             res.setHeader("Content-Type", "application/octet-stream");
-            res.setHeader("Content-Length", file.length);
+            res.setHeader("Content-Length", file.size);
 
             const stream = fs.createReadStream(filePath);
             stream.pipe(res);
             return;
         }
 
-        // ── Case 2: Not downloaded yet → resume + wait for done ──
-        torrent.resume();
+        // ── Already downloading → wait for done ──
+        if (meta.status === "downloading") {
+            const torrent = client.get(infoHash);
+            if (torrent) {
+                torrent.on("done", () => streamFile(torrent, infoHash, res));
+                return;
+            }
+        }
 
-        torrentMap.set(infoHash, {
-            ...meta,
-            status: "downloading",
-        });
+        // ── Queued → NOW start downloading via webtorrent ──
+        torrentMap.set(infoHash, { ...meta, status: "downloading" });
 
-        console.log(`⬇️  Downloading: ${torrent.name}`);
+        client.add(
+            meta.magnetURI,
+            {
+                path: DOWNLOAD_PATH,
+                announce: extraTrackers,
+            },
+            (torrent) => {
+                console.log(`⬇️ Started: ${torrent.name}`);
 
-        torrent.on("done", () => {
-            const files = torrent.files.map((f) => ({
-                name: f.name,
-                size: f.length,
-                path: f.path,
-            }));
+                torrent.on("done", () => {
+                    streamFile(torrent, infoHash, res);
+                });
 
-            torrentMap.set(infoHash, {
-                ...torrentMap.get(infoHash),
-                status: "completed",
-                files,
+                torrent.on("error", (err) => {
+                    torrentMap.set(infoHash, {
+                        ...torrentMap.get(infoHash),
+                        status: "error",
+                        error: err.message,
+                    });
+                    reject(err);
+                });
+            }
+        );
+    });
+};
+
+// ─── Helper: Stream file to browser ──────────────────────
+const streamFile = (torrent, infoHash, res) => {
+    const file = torrent.files[0];
+    const filePath = path.resolve("downloads", file.path);
+
+    const files = torrent.files.map((f) => ({
+        name: f.name,
+        size: f.length,
+        path: f.path,
+    }));
+
+    torrentMap.set(infoHash, {
+        ...torrentMap.get(infoHash),
+        status: "completed",
+        progress: 100,
+        done: true,
+        files,
+    });
+
+    console.log(`✅ Streaming to client: ${file.name}`);
+
+    res.setHeader("Content-Disposition", `attachment; filename="${file.name}"`);
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Length", file.length);
+
+    const stream = fs.createReadStream(filePath);
+    stream.pipe(res);
+};
+
+// ─── Remove Torrent ───────────────────────────────────────
+export const removeTorrent = (infoHash, deleteFiles = false) => {
+    return new Promise((resolve, reject) => {
+        const meta = torrentMap.get(infoHash);
+        if (!meta) return reject(new Error("Torrent not found"));
+
+        const torrent = client.get(infoHash);
+
+        if (torrent) {
+            // actively downloading → remove from webtorrent too
+            client.remove(infoHash, { destroyStore: deleteFiles }, (err) => {
+                if (err) return reject(err);
+                torrentMap.delete(infoHash);
+                resolve({ success: true });
             });
-
-            // stream file to user after download completes
-            const file = torrent.files[0];
-            const filePath = path.resolve("downloads", file.path);
-
-            res.setHeader("Content-Disposition", `attachment; filename="${file.name}"`);
-            res.setHeader("Content-Type", "application/octet-stream");
-            res.setHeader("Content-Length", file.length);
-
-            const stream = fs.createReadStream(filePath);
-            stream.pipe(res);
-        });
+        } else {
+            // just queued → remove from map only
+            torrentMap.delete(infoHash);
+            resolve({ success: true });
+        }
     });
 };
